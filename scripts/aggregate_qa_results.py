@@ -3,17 +3,20 @@
 Aggregate QA evaluation results from multiple JSON files.
 
 Usage:
-    python scripts/aggregate_qa_results.py [--max_articles N] [--group-by-target-size]
+    python scripts/aggregate_qa_results.py --eval-dir DIR [--max_articles N]
+        [--group-by-target-size] [--group-by-seed]
     
     --max_articles: Maximum number of articles to include (0-indexed, so --max_articles=10 means articles 0-9).
                     If not specified, processes all articles.
     --group-by-target-size: If specified, groups results by target_size in addition to query_config and method.
                             This keeps different target_size experiments separate instead of aggregating them together.
+    --group-by-seed: Aggregate shards within each seed, then report accuracy mean and sample standard deviation.
 """
 
 import argparse
 import json
 import re
+import statistics
 from collections import defaultdict
 from pathlib import Path
 
@@ -347,25 +350,55 @@ def aggregate_method_stats(method_stats_list):
     return aggregated
 
 
-def main(max_articles=None, group_by_target_size=False):
+def aggregate_method_stats_by_seed(stats_list):
+    """Aggregate shards within each seed, then summarize accuracy across seeds."""
+    stats_by_seed = defaultdict(list)
+    for stats in stats_list:
+        seed = stats.get("_aggregation_seed")
+        clean_stats = {k: v for k, v in stats.items() if k != "_aggregation_seed"}
+        stats_by_seed[seed].append(clean_stats)
+
+    per_seed = {
+        str(seed): aggregate_method_stats(seed_stats)
+        for seed, seed_stats in sorted(stats_by_seed.items(), key=lambda item: str(item[0]))
+    }
+    accuracies = [stats["overall_accuracy"] for stats in per_seed.values()]
+
+    return {
+        "num_seeds": len(per_seed),
+        "seeds": list(per_seed.keys()),
+        "accuracy_mean": statistics.mean(accuracies) if accuracies else 0.0,
+        "accuracy_std": statistics.stdev(accuracies) if len(accuracies) > 1 else 0.0,
+        "accuracy_min": min(accuracies) if accuracies else 0.0,
+        "accuracy_max": max(accuracies) if accuracies else 0.0,
+        "per_seed": per_seed,
+    }
+
+
+def main(eval_dir=None, max_articles=None, group_by_target_size=False, group_by_seed=False):
     """
     Main function to aggregate QA evaluation results.
 
     Args:
+        eval_dir: Directory containing evaluation JSON files. Uses EVAL_DIR when omitted.
         max_articles: Maximum number of articles to include (0-indexed, so max_articles=10 means articles 0-9).
                      If None, processes all articles.
         group_by_target_size: If True, groups results by target_size in addition to query_config and method.
                               This keeps different target_size experiments separate.
+        group_by_seed: If True, aggregate shards within seed before summarizing across seeds.
     """
-    eval_path = Path(EVAL_DIR)
+    eval_path = Path(eval_dir or EVAL_DIR)
 
     if not eval_path.exists():
-        print(f"Error: Directory {EVAL_DIR} does not exist")
+        print(f"Error: Directory {eval_path} does not exist")
         return
 
     # Find all JSON files
-    json_files = list(eval_path.glob("*.json"))
-    print(f"Found {len(json_files)} JSON files in {EVAL_DIR}")
+    json_files = sorted(
+        path for path in eval_path.glob("*.json")
+        if not path.name.startswith("aggregated_")
+    )
+    print(f"Found {len(json_files)} evaluation JSON files in {eval_path}")
 
     if max_articles is not None:
         print(f"Limiting to first {max_articles} articles (indices 0-{max_articles-1})")
@@ -482,6 +515,8 @@ def main(max_articles=None, group_by_target_size=False):
                 # Use dict() constructor which creates a shallow copy of the top-level dict
                 # For nested structures, we need to recursively copy
                 stats_copy = json.loads(json.dumps(stats))  # Serialize/deserialize to break all references
+                if group_by_seed:
+                    stats_copy["_aggregation_seed"] = config.get("seed")
                 method_query_stats[key].append(stats_copy)
 
             # Explicitly delete the large data structure to free memory immediately
@@ -540,12 +575,16 @@ def main(max_articles=None, group_by_target_size=False):
                 output_key = f"{output_key}_ignore-article-idx"
 
             print(f"Aggregating {len(stats_list)} results for: {output_key} (target_size={target_size})")
-            results_by_target_size[target_size][output_key] = aggregate_method_stats(stats_list)
+            if group_by_seed:
+                results_by_target_size[target_size][output_key] = aggregate_method_stats_by_seed(stats_list)
+            else:
+                results_by_target_size[target_size][output_key] = aggregate_method_stats(stats_list)
 
         # Write separate files for each target size
         output_files = []
         for target_size, aggregated_results in sorted(results_by_target_size.items()):
-            output_file = eval_path / f"aggregated_results_t{target_size}.json"
+            prefix = "aggregated_seed_results" if group_by_seed else "aggregated_results"
+            output_file = eval_path / f"{prefix}_t{target_size}.json"
             with open(output_file, 'w') as f:
                 json.dump(aggregated_results, f, indent=2)
             output_files.append(output_file)
@@ -556,6 +595,13 @@ def main(max_articles=None, group_by_target_size=False):
         for target_size, aggregated_results in sorted(results_by_target_size.items()):
             print(f"\nTarget Size: {target_size}")
             for method_name, stats in sorted(aggregated_results.items()):
+                if group_by_seed:
+                    print(f"  {method_name}:")
+                    print(
+                        f"    Accuracy: {stats['accuracy_mean']:.4f} +/- {stats['accuracy_std']:.4f} "
+                        f"({stats['num_seeds']} seeds, range {stats['accuracy_min']:.4f}-{stats['accuracy_max']:.4f})"
+                    )
+                    continue
                 accuracy = stats.get("overall_accuracy", 0)
                 num_articles = stats.get("num_articles", 0)
                 print(f"  {method_name}:")
@@ -586,10 +632,14 @@ def main(max_articles=None, group_by_target_size=False):
                 output_key = f"{output_key}_ignore-article-idx"
 
             print(f"Aggregating {len(stats_list)} results for: {output_key}")
-            aggregated_results[output_key] = aggregate_method_stats(stats_list)
+            if group_by_seed:
+                aggregated_results[output_key] = aggregate_method_stats_by_seed(stats_list)
+            else:
+                aggregated_results[output_key] = aggregate_method_stats(stats_list)
 
         # Write aggregated results
-        output_file = eval_path / "aggregated_results.json"
+        output_name = "aggregated_seed_results.json" if group_by_seed else "aggregated_results.json"
+        output_file = eval_path / output_name
         with open(output_file, 'w') as f:
             json.dump(aggregated_results, f, indent=2)
 
@@ -598,6 +648,13 @@ def main(max_articles=None, group_by_target_size=False):
         # Print summary
         print("\n=== Summary ===")
         for method_name, stats in sorted(aggregated_results.items()):
+            if group_by_seed:
+                print(f"{method_name}:")
+                print(
+                    f"  Accuracy: {stats['accuracy_mean']:.4f} +/- {stats['accuracy_std']:.4f} "
+                    f"({stats['num_seeds']} seeds, range {stats['accuracy_min']:.4f}-{stats['accuracy_max']:.4f})"
+                )
+                continue
             accuracy = stats.get("overall_accuracy", 0)
             num_articles = stats.get("num_articles", 0)
             print(f"{method_name}:")
@@ -615,6 +672,12 @@ if __name__ == "__main__":
         description="Aggregate QA evaluation results from multiple JSON files."
     )
     parser.add_argument(
+        "--eval-dir",
+        type=str,
+        default=None,
+        help=f"Directory containing evaluation JSON files (default: {EVAL_DIR})."
+    )
+    parser.add_argument(
         "--max_articles",
         type=int,
         default=None,
@@ -627,5 +690,15 @@ if __name__ == "__main__":
         help="If specified, groups results by target_size in addition to query_config and method. "
              "This keeps different target_size experiments separate instead of aggregating them together."
     )
+    parser.add_argument(
+        "--group-by-seed",
+        action="store_true",
+        help="Aggregate shards within each seed, then report accuracy mean and sample standard deviation across seeds."
+    )
     args = parser.parse_args()
-    main(max_articles=args.max_articles, group_by_target_size=args.group_by_target_size)
+    main(
+        eval_dir=args.eval_dir,
+        max_articles=args.max_articles,
+        group_by_target_size=args.group_by_target_size,
+        group_by_seed=args.group_by_seed,
+    )

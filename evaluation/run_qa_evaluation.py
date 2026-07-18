@@ -22,6 +22,9 @@ Example usage:
     python -m evaluation.run_qa_evaluation --dataset-name longhealth5 --chunking longhealth --model-name google/gemma-3-4b-it --query-config repeat --precomputed-budget-path head_budget_optimization/head_budgets/gemma-3-4b-it/optimized_agnostic.json
 """
 import argparse
+import random
+
+import numpy as np
 import torch
 
 from .qa_evaluator import QAEvaluator
@@ -206,8 +209,22 @@ def main():
         default=None,
         help='Experiment name for logging (default: None)'
     )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='Random seed for Python, NumPy, and PyTorch CPU/CUDA RNGs (default: None)'
+    )
 
     args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"Random seed: {args.seed}")
 
     # Load algorithm hyperparameter config (pass target_size for configs that use it)
     method_config = load_algorithm_config(args.algorithm_config, target_size=args.target_size)
@@ -313,7 +330,8 @@ def main():
         experiment_name=args.name,
         algorithm_config_file=args.algorithm_config,
         query_config_file=args.query_config,
-        ignore_article_indices=args.ignore_article_indices
+        ignore_article_indices=args.ignore_article_indices,
+        seed=args.seed,
     )
 
 if __name__ == "__main__":

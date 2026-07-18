@@ -34,6 +34,13 @@ config = {
         'c2_method': 'lsq',
         'on_policy': True,
     },
+    'random_subset_keys_nnls2_-3_3_lsq': {
+        'algorithm': 'random_subset_keys',
+        'nnls_iters': 2,
+        'nnls_lower_bound': exp(-3),
+        'nnls_upper_bound': exp(3),
+        'c2_method': 'lsq',
+    },
     'highest_attn_keys_rms_nnls2_-3_3_lsq_on-policy': {
         'algorithm': 'highest_attention_keys',
         'score_method': 'rms',

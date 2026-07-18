@@ -2099,6 +2099,7 @@ class QAEvaluator:
         algorithm_config_file: Optional[str] = None,
         query_config_file: Optional[str] = None,
         ignore_article_indices: bool = False,
+        seed: Optional[int] = None,
     ) -> Dict:
         """
         Run evaluation across multiple articles and methods.
@@ -2143,6 +2144,8 @@ class QAEvaluator:
         ignore_article_indices : bool
             If True, ignore article boundaries and compact the entire sequence.
             target_size then refers to the whole sequence rather than just the article portion.
+        seed : int, optional
+            Random seed used for this evaluation run.
 
         Returns
         -------
@@ -2328,6 +2331,7 @@ class QAEvaluator:
                 'query_config': query_config_dict,
                 'compute_stats': compute_stats,
                 'compute_perplexity': compute_perplexity,
+                'seed': seed,
             },
             'results': all_results
         }

@@ -56,6 +56,7 @@ class RandomSubsetKeysCompaction(CompactionAlgorithm):
         V: torch.Tensor,
         queries: torch.Tensor,
         t: int,
+        attention_bias: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]:
         """
         Compute compacted cache using random candidate selection.
@@ -70,6 +71,8 @@ class RandomSubsetKeysCompaction(CompactionAlgorithm):
             Query samples for training
         t : int
             Compacted size (number of keys to select)
+        attention_bias : Tensor, optional
+            Additive attention bias for the original cache (broadcastable to (n, T)).
         Returns
         -------
         C1 : Tensor, shape (t, d)
@@ -81,14 +84,21 @@ class RandomSubsetKeysCompaction(CompactionAlgorithm):
         indices : list of int
             Indices of selected keys
         """
+        self._validate_target_size(t, K.shape[0])
+        if t == 0:
+            return K[:0], K.new_empty(0), V[:0], []
+
         # Select keys using random candidate selection
-        C1, beta, indices = self._select_keys_random_candidate(K, queries, t)
+        C1, beta, indices = self._select_keys_random_candidate(
+            K, queries, t, attention_bias=attention_bias
+        )
 
         # Compute compacted values
         C2 = self._compute_C2_with_method(
             C1, beta, K, V, queries,
             method=self.c2_method,
             indices=indices,
+            attention_bias=attention_bias,
             ridge_lambda=self.c2_ridge_lambda,
             solver=self.c2_solver,
             ridge_scale=self.c2_ridge_scale
@@ -101,6 +111,7 @@ class RandomSubsetKeysCompaction(CompactionAlgorithm):
         K: torch.Tensor,
         queries: torch.Tensor,
         t: int,
+        attention_bias: torch.Tensor = None,
     ):
         """
         Random selection of t keys from K from the set of candidates (keys not yet selected).
@@ -114,6 +125,8 @@ class RandomSubsetKeysCompaction(CompactionAlgorithm):
             Sampled query vectors.
         t : int
             Number of keys to select for the compacted cache.
+        attention_bias : Tensor, optional
+            Additive attention bias for the original cache (broadcastable to (n, T)).
 
         Returns
         -------
@@ -136,12 +149,22 @@ class RandomSubsetKeysCompaction(CompactionAlgorithm):
         # Compute beta based on beta_method
         if self.beta_method == 'zero':
             # Set all beta values to 0 (compute in fp32)
-            beta = torch.zeros(t, dtype=torch.float32, device=device)
+            beta32 = torch.zeros(t, dtype=torch.float32, device=device)
         else:  # 'nnls'
             # Precompute in policy style: QK in original dtype, softmax path in fp32
             inv_sqrt_d = (1.0 / d) ** 0.5
             scores_raw = queries @ K.T                                 # (n, T) original dtype
             scores32 = scores_raw.to(torch.float32) * inv_sqrt_d       # (n, T) fp32
+            if attention_bias is not None:
+                try:
+                    scores32 = scores32 + torch.broadcast_to(
+                        attention_bias.to(torch.float32), scores32.shape
+                    )
+                except Exception as e:
+                    raise ValueError(
+                        f"attention_bias must be broadcastable to {scores32.shape}, "
+                        f"got {tuple(attention_bias.shape)}"
+                    ) from e
             max_scores = scores32.max(dim=1, keepdim=True)[0]          # (n, 1) fp32
             exp_scores = torch.exp(scores32 - max_scores)              # (n, T) fp32
             target = exp_scores.sum(dim=1)                             # (n,) fp32
@@ -149,9 +172,16 @@ class RandomSubsetKeysCompaction(CompactionAlgorithm):
             # Design matrix for the selected subset and NNLS
             M = exp_scores[:, sel_idx]                                 # (n, t) fp32
             B = self._nnls_pg(M, target, self.nnls_iters, self.nnls_lower_bound, self.nnls_upper_bound)              # (t,) fp32, >= 0
-            beta = torch.log(B)                       # (t,) fp32
+            beta32 = torch.log(B)                       # (t,) fp32
 
-        return C1, beta, selected_indices
+        return C1, beta32.to(K.dtype), selected_indices
+
+    @staticmethod
+    def _validate_target_size(t: int, num_keys: int) -> None:
+        if not isinstance(t, int):
+            raise TypeError(f"t must be an int, got {type(t).__name__}")
+        if t < 0 or t > num_keys:
+            raise ValueError(f"t must satisfy 0 <= t <= {num_keys}, got {t}")
 
 
 class BatchedRandomSubsetKeysCompaction(BatchedCompactionAlgorithm):
@@ -216,6 +246,13 @@ class BatchedRandomSubsetKeysCompaction(BatchedCompactionAlgorithm):
         indices : Tensor, shape (B, t)
             Indices of selected keys for each instance
         """
+        RandomSubsetKeysCompaction._validate_target_size(t, K.shape[1])
+        if t == 0:
+            batch_size = K.shape[0]
+            return K[:, :0], K.new_empty(batch_size, 0), V[:, :0], torch.empty(
+                batch_size, 0, dtype=torch.long, device=K.device
+            )
+
         # Select keys using batched random candidate selection
         C1, beta, indices = self._select_keys_random_candidate_batched(K, queries, t)
 
@@ -267,7 +304,7 @@ class BatchedRandomSubsetKeysCompaction(BatchedCompactionAlgorithm):
         # Compute beta based on beta_method
         if self.beta_method == 'zero':
             # Set all beta values to 0 (compute in fp32)
-            beta = torch.zeros(B, t, dtype=torch.float32, device=device)
+            beta32 = torch.zeros(B, t, dtype=torch.float32, device=device)
         else:  # 'nnls'
             # Compute exp_scores and target using shared primitive
             exp_scores, target = self.compute_exp_scores_and_target_batched(K, queries)
@@ -283,6 +320,6 @@ class BatchedRandomSubsetKeysCompaction(BatchedCompactionAlgorithm):
 
             # Batched NNLS solve using shared primitive
             B_solution = self.box_ls_pg_batched(M, target, self.nnls_iters, self.nnls_lower_bound, self.nnls_upper_bound)  # (B, t) fp32 (>=0)
-            beta = torch.log(B_solution)  # (B, t) fp32
+            beta32 = torch.log(B_solution)  # (B, t) fp32
 
-        return C1, beta, selected_indices_tensor
+        return C1, beta32.to(K.dtype), selected_indices_tensor

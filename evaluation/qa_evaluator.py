@@ -2180,20 +2180,26 @@ class QAEvaluator:
               f"max_query_vectors_per_kv_head={query_config.max_query_vectors_per_kv_head}")
         print(f"{'='*60}\n")
 
-        # Initialize vLLM once if needed (will be reused across all articles)
-        # vLLM is needed for:
-        # 1. Self-study query generation
-        # 2. Summarization compaction methods
-        # 3. Original method generation (vLLM handles long contexts more efficiently)
-        # 4. Reference answer generation for compute_stats/compute_perplexity
+        # Initialize vLLM once if needed (will be reused across all articles).
+        # Some paths can fall back to HuggingFace, while text generation methods
+        # and generative self-study specs still require vLLM.
         need_vllm = False
+        require_vllm = False
 
-        # Check if self_study query generation needs vLLM
-        self_study_config = query_config.get_method_config('self_study')
-        if self_study_config is not None:
-            need_vllm = True
+        # Direct prefill specs such as `repeat` do not generate text and therefore
+        # do not need vLLM. All other self-study specs do.
+        self_study_method_config = query_config.get_method_config('self_study')
+        if self_study_method_config is not None:
+            specs = self_study_method_config.config.conversation_specs
+            self_study_requires_generation = any(
+                not spec.is_prefill() or not spec.is_direct()
+                for spec in specs
+            )
+            if self_study_requires_generation:
+                need_vllm = True
+                require_vllm = True
 
-        # Check if compute_stats or compute_perplexity needs vLLM for reference answer generation
+        # Reference answer generation prefers vLLM but already has a HuggingFace fallback.
         if compute_stats or compute_perplexity:
             need_vllm = True
 
@@ -2202,15 +2208,22 @@ class QAEvaluator:
             if method_name == 'original':
                 # Use vLLM for original method to handle long contexts efficiently
                 need_vllm = True
+                require_vllm = True
                 break
             kwargs = (method_kwargs or {}).get(method_name, {})
             base_algorithm = kwargs.get('algorithm', method_name)
             if base_algorithm == 'summarize':
                 need_vllm = True
+                require_vllm = True
                 break
 
         if need_vllm and self.vllm_model is None:
-            self.vllm_model = initialize_vllm(self.model_name, max_model_len=self.max_model_len)
+            try:
+                self.vllm_model = initialize_vllm(self.model_name, max_model_len=self.max_model_len)
+            except ImportError:
+                if require_vllm:
+                    raise
+                print("vLLM is not installed; using the HuggingFace fallback for reference generation.")
 
         # Detect if this is a perplexity-based dataset
         is_perplexity_eval = is_perplexity_dataset(dataset_name)

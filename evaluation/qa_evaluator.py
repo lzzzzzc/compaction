@@ -2188,7 +2188,9 @@ class QAEvaluator:
         # Check if self_study query generation needs vLLM
         self_study_config = query_config.get_method_config('self_study')
         if self_study_config is not None:
-            need_vllm = True
+            specs = self_study_config.config.conversation_specs
+            # Pure prefill specs such as "repeat" bypass vLLM generation.
+            need_vllm = any(not spec.is_prefill() for spec in specs)
 
         # Check if compute_stats or compute_perplexity needs vLLM for reference answer generation
         if compute_stats or compute_perplexity:

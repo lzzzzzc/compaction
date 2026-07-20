@@ -701,6 +701,55 @@ def print_train_stats(compaction_stats: Dict):
           f"(mean of RMS: {train_stats.get('mean_rms_sumexp_relative_error', 0):.6e})")
 
 
+def print_fitting_diagnostics(compaction_stats: Dict):
+    """Print exact C2 training residuals and per-head key-matrix summaries."""
+    diagnostics = compaction_stats.get('fitting_diagnostics', {})
+    print(f"\n{'='*60}")
+    print("FITTING-ONLY DIAGNOSTICS")
+    print(f"{'='*60}")
+
+    if diagnostics.get('mse') is None:
+        print("No C2 least-squares fit was recorded for this method.")
+    else:
+        print("Exact C2 training reconstruction error (X @ C2 - Y):")
+        print(
+            f"  heads: {diagnostics['num_heads_with_c2_fit']}/"
+            f"{diagnostics['num_heads_total']}"
+        )
+        print(f"  global MSE:         {diagnostics['mse']:.6e}")
+        print(f"  global RMSE:        {diagnostics['rmse']:.6e}")
+        print(f"  global relative L2: {diagnostics['relative_l2']:.6e}")
+
+    print("\nPer-layer/head fitting error and key matrices:")
+    for head_name, head_stats in compaction_stats.get('per_layer_head_metrics', {}).items():
+        fit = head_stats.get('c2_fit_stats')
+        key_stats = head_stats.get('key_matrix_stats', {})
+        original = key_stats.get('original_K')
+        compacted = key_stats.get('compacted_C1')
+
+        if fit is not None:
+            print(
+                f"[{head_name}] fit: MSE={fit['mse']:.6e}, "
+                f"RMSE={fit['rmse']:.6e}, rel_L2={fit['relative_l2']:.6e}, "
+                f"MAE={fit['mae']:.6e}, max_abs={fit['max_abs_error']:.6e}, "
+                f"Q={fit['num_queries']}, C1={fit['num_compacted_keys']}, d={fit['head_dim']}"
+            )
+        else:
+            print(f"[{head_name}] fit: unavailable (no C2 least-squares solve)")
+
+        for label, matrix in (("original_K", original), ("compacted_C1", compacted)):
+            if matrix is None:
+                continue
+            print(
+                f"  {label}: shape={matrix['shape']}, dtype={matrix['dtype']}, "
+                f"device={matrix['device']}, finite={matrix['finite_fraction']:.6f}, "
+                f"min={matrix['min']}, max={matrix['max']}, mean={matrix['mean']}, "
+                f"std={matrix['std']}, fro={matrix['frobenius_norm']}, "
+                f"row_L2[min/mean/max]={matrix['row_l2_min']}/"
+                f"{matrix['row_l2_mean']}/{matrix['row_l2_max']}"
+            )
+
+
 def compute_all_head_stats(per_layer_head_metrics: Dict, eval_queries_per_kv_head: int) -> Dict:
     """
     Compute aggregated statistics across all heads from per-layer-head metrics.

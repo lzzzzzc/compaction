@@ -11,6 +11,7 @@ import time
 from typing import Tuple, Dict, Optional, Type, Any
 
 from .base import FullCacheCompactionAlgorithm, load_budgets_from_json, apply_max_ratio_cap
+from .per_layer_head import PerLayerHeadCompaction
 from ..algorithms.base import CompactionAlgorithm
 from ..query_generation import QueryConfig
 
@@ -63,6 +64,10 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
             return self.config_name
         return f"per_layer_head_on_policy_{self._name_instance.name()}"
 
+    def supports_fitting_diagnostics(self) -> bool:
+        """This wrapper can expose exact C2-fit and key-matrix diagnostics."""
+        return True
+
     def _get_sliding_window(self, model) -> Optional[int]:
         """Extract sliding window size from model config."""
         return getattr(model.config, 'sliding_window', None)
@@ -82,6 +87,7 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
         sliding_layer_indices: Optional[set] = None,
         past_key_values_for_queries: Optional[Any] = None,
         query_cache_article_boundaries: Optional[Tuple[int, int]] = None,
+        fitting_diagnostics: bool = False,
     ) -> Tuple[Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...], Dict]:
         """
         Compact each (layer, head) pair independently using on-policy queries for layers > 0.
@@ -121,6 +127,7 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
         stats : dict
             Statistics including per-layer-head metrics and query generation stats
         """
+        self._fitting_diagnostics_enabled = fitting_diagnostics
         num_layers = len(past_key_values)
         # Find a non-sliding layer to get the full sequence length
         # (sliding layers may have shorter seq_len due to window size)
@@ -459,6 +466,7 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
                     head_target_size = actual_target_size
 
                 # Handle zero-budget heads: skip compaction and return empty tensors
+                algorithm = None
                 if head_target_size == 0:
                     C1_compact = K.new_zeros(0, head_dim)
                     beta_compact = K.new_zeros(0)
@@ -467,6 +475,7 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
                 else:
                     # Create algorithm instance and run compaction
                     algorithm = self.algorithm_class(**self.algorithm_kwargs)
+                    algorithm.collect_fitting_diagnostics = self._fitting_diagnostics_enabled
                     C1_compact, beta_compact, C2_compact, selected_indices = algorithm.compute_compacted_cache(
                         K, V, queries_for_compaction, head_target_size
                     )
@@ -539,6 +548,17 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
                         'num_less_than_minus_7': int((beta_for_stats < -7).sum().item()) if len(beta_for_stats) > 0 else 0,
                     }} if verbose_logging else {})
                 }
+
+                if self._fitting_diagnostics_enabled:
+                    head_stats['key_matrix_stats'] = {
+                        'original_K': PerLayerHeadCompaction._matrix_stats(K),
+                        'compacted_C1': PerLayerHeadCompaction._matrix_stats(
+                            C1_compact[:actual_returned_size]
+                        ),
+                    }
+                    fit_stats = getattr(algorithm, 'last_c2_fit_stats', None) if algorithm is not None else None
+                    if fit_stats is not None:
+                        head_stats['c2_fit_stats'] = fit_stats
 
                 # Compute train stats if requested
                 if compute_stats:
@@ -632,6 +652,9 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
 
         if compute_stats:
             self._aggregate_train_stats(all_stats, query_config.eval_queries_per_kv_head)
+
+        if fitting_diagnostics:
+            PerLayerHeadCompaction._aggregate_fitting_diagnostics(all_stats)
 
         return tuple(compacted_layers), all_stats
 

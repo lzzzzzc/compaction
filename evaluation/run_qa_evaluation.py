@@ -147,6 +147,12 @@ def main():
         default=0,
         help='Only compute perplexity without generating new answers (implies --compute-perplexity). 1 to enable, 0 to disable (default: 0)'
     )
+    parser.add_argument(
+        '--fitting-only',
+        type=int,
+        default=0,
+        help='Run only prefill, query construction, and KV compaction; print exact C2 fitting error and key-matrix statistics, then skip all QA/perplexity generation. 1 to enable, 0 to disable (default: 0)'
+    )
 
     # Model arguments
     parser.add_argument(
@@ -217,6 +223,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.fitting_only:
+        if args.compute_stats or args.compute_perplexity or args.perplexity_only:
+            print(
+                "Fitting-only mode: forcing --compute-stats 0, "
+                "--compute-perplexity 0, and --perplexity-only 0"
+            )
+        args.compute_stats = 0
+        args.compute_perplexity = 0
+        args.perplexity_only = 0
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -325,6 +341,7 @@ def main():
         verbose_logging=bool(args.verbose_logging),
         compute_perplexity=bool(args.compute_perplexity or args.perplexity_only),
         perplexity_only=bool(args.perplexity_only),
+        fitting_only=bool(args.fitting_only),
         method_kwargs=method_kwargs,
         log_dir=args.log_dir,
         experiment_name=args.name,

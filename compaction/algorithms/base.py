@@ -237,6 +237,31 @@ class CompactionAlgorithm(ABC):
         else:
             raise ValueError(f"Unknown solver: {solver}. Must be 'pinv', 'cholesky', or 'lstsq'.")
 
+        if getattr(self, 'collect_fitting_diagnostics', False):
+            with torch.no_grad():
+                residual = X @ C2_32 - Y
+                residual_sse = residual.square().sum()
+                target_sse = Y.square().sum()
+                eps = torch.finfo(torch.float32).eps
+                self.last_c2_fit_stats = {
+                    'num_queries': int(n),
+                    'num_compacted_keys': int(t),
+                    'head_dim': int(d),
+                    'residual_numel': int(residual.numel()),
+                    'residual_sse': float(residual_sse.item()),
+                    'target_sse': float(target_sse.item()),
+                    'mse': float((residual_sse / max(residual.numel(), 1)).item()),
+                    'rmse': float(torch.sqrt(residual_sse / max(residual.numel(), 1)).item()),
+                    'relative_l2': float(
+                        (torch.sqrt(residual_sse) / torch.sqrt(target_sse.clamp_min(eps))).item()
+                    ),
+                    'mae': float(residual.abs().mean().item()),
+                    'max_abs_error': float(residual.abs().max().item()),
+                    'solver': solver,
+                    'ridge_lambda': float(ridge_lambda),
+                    'ridge_scale': ridge_scale,
+                }
+
         return C2_32.to(dtype_param)
 
     def _compute_C2_on_policy(

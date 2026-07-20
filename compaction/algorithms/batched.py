@@ -208,6 +208,36 @@ class BatchedCompactionAlgorithm(ABC):
         else:
             raise ValueError(f"Unknown solver: {solver}. Must be 'pinv', 'cholesky', or 'lstsq'.")
 
+        if getattr(self, 'collect_fitting_diagnostics', False):
+            with torch.no_grad():
+                residual = torch.bmm(X, C2_32) - Y
+                residual_sse = residual.square().sum(dim=(1, 2))
+                target_sse = Y.square().sum(dim=(1, 2))
+                residual_numel = residual.shape[1] * residual.shape[2]
+                eps = torch.finfo(torch.float32).eps
+                mse = residual_sse / max(residual_numel, 1)
+                self.last_c2_fit_stats = []
+                for batch_idx in range(B):
+                    self.last_c2_fit_stats.append({
+                        'num_queries': int(n),
+                        'num_compacted_keys': int(t),
+                        'head_dim': int(d),
+                        'residual_numel': int(residual_numel),
+                        'residual_sse': float(residual_sse[batch_idx].item()),
+                        'target_sse': float(target_sse[batch_idx].item()),
+                        'mse': float(mse[batch_idx].item()),
+                        'rmse': float(torch.sqrt(mse[batch_idx]).item()),
+                        'relative_l2': float((
+                            torch.sqrt(residual_sse[batch_idx])
+                            / torch.sqrt(target_sse[batch_idx].clamp_min(eps))
+                        ).item()),
+                        'mae': float(residual[batch_idx].abs().mean().item()),
+                        'max_abs_error': float(residual[batch_idx].abs().max().item()),
+                        'solver': solver,
+                        'ridge_lambda': float(ridge_lambda),
+                        'ridge_scale': ridge_scale,
+                    })
+
         return C2_32.to(dtype_param)
 
     def _direct_C2_batched(

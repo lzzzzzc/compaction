@@ -30,6 +30,7 @@ from .utils import (
     compute_cache_memory_stats,
     print_query_generation_stats,
     print_train_stats,
+    print_fitting_diagnostics,
     print_test_stats,
     offload_model_to_cpu,
     reload_model_to_gpu,
@@ -371,6 +372,7 @@ class QAEvaluator:
         is_perplexity_eval: bool = False,
         is_ruler_eval: bool = False,
         is_qasper_eval: bool = False,
+        fitting_only: bool = False,
     ) -> Dict:
         """
         Evaluate a compaction method on a single article.
@@ -410,6 +412,12 @@ class QAEvaluator:
             Evaluation results including QA accuracy and optional stats
         """
         from .utils import format_context
+
+        if fitting_only and not compaction_method.supports_fitting_diagnostics():
+            raise ValueError(
+                f"Method '{compaction_method.name()}' does not support --fitting-only. "
+                "Use a per-layer/head method with C2 least-squares fitting."
+            )
 
         # Determine if this is a text-based method (returns context text instead of cache)
         use_text_based_generation = not compaction_method.returns_cache()
@@ -611,7 +619,7 @@ class QAEvaluator:
             print(f"Using QueryConfig: methods=[{methods_str}], "
                   f"max_query_vectors_per_kv_head={query_config.max_query_vectors_per_kv_head}")
 
-            compacted_cache, compaction_stats = compaction_method.compact_kv_cache(
+            compact_kwargs = dict(
                 past_key_values=past_key_values,
                 target_size=actual_target_size,
                 indices=indices_for_compaction,  # None if ignoring article boundaries, else article_indices
@@ -624,6 +632,9 @@ class QAEvaluator:
                 vllm_model=self.vllm_model,  # Pass vLLM model
                 sliding_layer_indices=sliding_layer_indices,
             )
+            if fitting_only:
+                compact_kwargs['fitting_diagnostics'] = True
+            compacted_cache, compaction_stats = compaction_method.compact_kv_cache(**compact_kwargs)
             total_compaction_time = time.time() - start_time
 
             # Extract query generation time and compute compaction time excluding query generation
@@ -734,12 +745,18 @@ class QAEvaluator:
         # Print aggregated train stats if available
         print_train_stats(compaction_stats)
 
+        if fitting_only:
+            print_fitting_diagnostics(compaction_stats)
+
         # Evaluate on questions (will also extract test queries if compute_stats=True)
         # We need to do this before computing detailed stats to extract test queries
         all_questions = article_data['questions']
 
         # Shuffle and select n_questions_per_article if specified
-        if n_questions_per_article is not None:
+        if fitting_only:
+            questions = []
+            print("Fitting-only mode: skipping all question answering and perplexity evaluation.")
+        elif n_questions_per_article is not None:
             import random
             rng = random.Random(67)
             questions = all_questions.copy()
@@ -811,7 +828,13 @@ class QAEvaluator:
 
         # Handle perplexity-based datasets (like LongSWE-bench)
         # These have ground_truth instead of options/gold_label
-        if is_perplexity_eval:
+        if fitting_only:
+            qa_results = {
+                'num_questions': 0,
+                'results_per_question': [],
+                'note': 'Fitting-only mode - no answers generated',
+            }
+        elif is_perplexity_eval:
             print(f"\n{'='*60}")
             print(f"Computing perplexity on ground_truth (perplexity-based dataset)...")
             print(f"{'='*60}")
@@ -1254,7 +1277,13 @@ class QAEvaluator:
                 print(f"Warning: No reference answers available, skipping perplexity computation")
 
         # Compute accuracy metrics
-        if is_perplexity_eval:
+        if fitting_only:
+            qa_results = {
+                'num_questions': 0,
+                'results_per_question': [],
+                'note': 'Fitting-only mode - no answers generated',
+            }
+        elif is_perplexity_eval:
             # Perplexity-based dataset: no accuracy metrics, just perplexity
             qa_results = {
                 'num_questions': len(questions),
@@ -2093,6 +2122,7 @@ class QAEvaluator:
         verbose_logging: bool = False,
         compute_perplexity: bool = False,
         perplexity_only: bool = False,
+        fitting_only: bool = False,
         method_kwargs: Optional[Dict[str, Dict]] = None,
         log_dir: str = 'logs/qa_evaluation',
         experiment_name: Optional[str] = None,
@@ -2154,6 +2184,12 @@ class QAEvaluator:
         """
         from compaction.compaction_methods import get_compaction_method
 
+        if fitting_only and (compute_stats or compute_perplexity or perplexity_only):
+            raise ValueError(
+                "fitting_only must be used with compute_stats=False, "
+                "compute_perplexity=False, and perplexity_only=False"
+            )
+
         # Load dataset
         dataset = load_dataset(dataset_name)
 
@@ -2167,13 +2203,14 @@ class QAEvaluator:
             article_indices = list(range(start_article, end_article))
 
         print(f"\n{'='*60}")
-        print(f"QA EVALUATION")
+        print("FITTING DIAGNOSTICS" if fitting_only else "QA EVALUATION")
         print(f"{'='*60}")
         print(f"Methods: {', '.join(compaction_methods)}")
         print(f"Articles: {len(article_indices)}")
         print(f"Target size: {target_size}")
         print(f"Ignore article indices: {ignore_article_indices}")
         print(f"Compute stats: {compute_stats}")
+        print(f"Fitting only: {fitting_only}")
         print(f"Device: {self.device}")
         methods_str = ", ".join([f"{mc.method}({mc.fraction:.1%})" for mc in query_config.method_configs])
         print(f"Query config: methods=[{methods_str}], "
@@ -2287,6 +2324,7 @@ class QAEvaluator:
                     is_perplexity_eval=is_perplexity_eval,
                     is_ruler_eval=is_ruler_eval,
                     is_qasper_eval=is_qasper_eval,
+                    fitting_only=fitting_only,
                 )
 
                 all_results.append(result)
@@ -2344,6 +2382,7 @@ class QAEvaluator:
                 'query_config': query_config_dict,
                 'compute_stats': compute_stats,
                 'compute_perplexity': compute_perplexity,
+                'fitting_only': fitting_only,
                 'seed': seed,
             },
             'results': all_results
@@ -2357,7 +2396,8 @@ class QAEvaluator:
             json.dump(output, f, indent=2)
 
         # Log overall results
-        self._log_overall_results(overall_stats, compaction_methods)
+        if not fitting_only:
+            self._log_overall_results(overall_stats, compaction_methods)
 
         print(f"\n{'='*60}")
         print(f"Evaluation complete! Results saved to:")

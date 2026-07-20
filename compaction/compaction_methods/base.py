@@ -63,6 +63,10 @@ class FullCacheCompactionAlgorithm(ABC):
         """
         return True
 
+    def supports_fitting_diagnostics(self) -> bool:
+        """Return whether this method can report exact C2 fitting diagnostics."""
+        return False
+
     @abstractmethod
     def compact_kv_cache(
         self,

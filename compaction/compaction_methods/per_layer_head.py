@@ -70,6 +70,96 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
             return self.config_name
         return f"per_layer_head_{self._name_instance.name()}"
 
+    def supports_fitting_diagnostics(self) -> bool:
+        """This wrapper can expose exact C2-fit and key-matrix diagnostics."""
+        return True
+
+    @staticmethod
+    def _matrix_stats(matrix: torch.Tensor) -> Dict:
+        """Return compact, JSON-safe descriptive statistics for a key matrix."""
+        stats = {
+            'shape': list(matrix.shape),
+            'dtype': str(matrix.dtype),
+            'device': str(matrix.device),
+            'numel': int(matrix.numel()),
+        }
+        if matrix.numel() == 0:
+            stats.update({
+                'finite_fraction': 1.0,
+                'min': None,
+                'max': None,
+                'mean': None,
+                'std': None,
+                'frobenius_norm': 0.0,
+                'row_l2_min': None,
+                'row_l2_max': None,
+                'row_l2_mean': None,
+            })
+            return stats
+
+        matrix32 = matrix.detach().to(torch.float32)
+        finite_mask = torch.isfinite(matrix32)
+        finite_fraction = finite_mask.float().mean()
+        finite_values = matrix32[finite_mask]
+        stats['finite_fraction'] = float(finite_fraction.item())
+        if finite_values.numel() == 0:
+            stats.update({
+                'min': None,
+                'max': None,
+                'mean': None,
+                'std': None,
+                'frobenius_norm': None,
+                'row_l2_min': None,
+                'row_l2_max': None,
+                'row_l2_mean': None,
+            })
+            return stats
+
+        stats.update({
+            'min': float(finite_values.min().item()),
+            'max': float(finite_values.max().item()),
+            'mean': float(finite_values.mean().item()),
+            'std': float(finite_values.std(unbiased=False).item()),
+        })
+        if bool(finite_mask.all().item()):
+            row_norms = torch.linalg.vector_norm(matrix32, dim=-1)
+            stats.update({
+                'frobenius_norm': float(torch.linalg.vector_norm(matrix32).item()),
+                'row_l2_min': float(row_norms.min().item()),
+                'row_l2_max': float(row_norms.max().item()),
+                'row_l2_mean': float(row_norms.mean().item()),
+            })
+        else:
+            stats.update({
+                'frobenius_norm': None,
+                'row_l2_min': None,
+                'row_l2_max': None,
+                'row_l2_mean': None,
+            })
+        return stats
+
+    @staticmethod
+    def _aggregate_fitting_diagnostics(all_stats: Dict) -> None:
+        """Aggregate exact per-head C2 residuals without another attention pass."""
+        fit_stats = [
+            metrics['c2_fit_stats']
+            for metrics in all_stats['per_layer_head_metrics'].values()
+            if 'c2_fit_stats' in metrics
+        ]
+        residual_sse = sum(item['residual_sse'] for item in fit_stats)
+        target_sse = sum(item['target_sse'] for item in fit_stats)
+        residual_numel = sum(item['residual_numel'] for item in fit_stats)
+        all_stats['fitting_diagnostics'] = {
+            'num_heads_with_c2_fit': len(fit_stats),
+            'num_heads_total': len(all_stats['per_layer_head_metrics']),
+            'residual_numel': residual_numel,
+            'residual_sse': residual_sse,
+            'target_sse': target_sse,
+            'mse': residual_sse / residual_numel if residual_numel else None,
+            'rmse': (residual_sse / residual_numel) ** 0.5 if residual_numel else None,
+            'relative_l2': (residual_sse / max(target_sse, 1e-30)) ** 0.5 if fit_stats else None,
+        }
+
     @staticmethod
     def _split_layer_cache(layer_tuple):
         """
@@ -129,6 +219,7 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
         sliding_layer_indices: Optional[set] = None,
         past_key_values_for_queries: Optional[Any] = None,
         full_query_extraction: bool = False,
+        fitting_diagnostics: bool = False,
     ) -> Tuple[Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...], Dict]:
         """
         Compact each (layer, head) pair independently.
@@ -179,6 +270,8 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
         stats : dict
             Statistics including per-layer-head metrics and query generation stats
         """
+        self._fitting_diagnostics_enabled = fitting_diagnostics
+
         # Keep a reference for query generation before we normalize the main cache
         kv_for_queries = past_key_values_for_queries if past_key_values_for_queries is not None else past_key_values
 
@@ -398,6 +491,9 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                 sliding_layer_indices
             )
 
+        if fitting_diagnostics:
+            self._aggregate_fitting_diagnostics(all_stats)
+
         return tuple(compacted_layers), all_stats
 
     def _get_batched_algorithm_map(self):
@@ -511,6 +607,7 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                     head_target_size = actual_target_size
 
                 # Handle zero-budget heads: skip compaction and return empty tensors
+                algorithm = None
                 if head_target_size == 0:
                     C1_compact = K.new_zeros(0, head_dim)
                     beta_compact = K.new_zeros(0)
@@ -519,6 +616,7 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                 else:
                     # Create algorithm instance for this head
                     algorithm = self.algorithm_class(**self.algorithm_kwargs)
+                    algorithm.collect_fitting_diagnostics = self._fitting_diagnostics_enabled
 
                     # Compact this head (or the subset)
                     C1_compact, beta_compact, C2_compact, selected_indices = algorithm.compute_compacted_cache(
@@ -607,6 +705,15 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                         'num_less_than_minus_7': int((beta_for_stats < -7).sum().item()) if len(beta_for_stats) > 0 else 0,
                     }} if verbose_logging else {})
                 }
+
+                if self._fitting_diagnostics_enabled:
+                    head_stats['key_matrix_stats'] = {
+                        'original_K': self._matrix_stats(K),
+                        'compacted_C1': self._matrix_stats(C1_compact[:actual_returned_size]),
+                    }
+                    fit_stats = getattr(algorithm, 'last_c2_fit_stats', None) if algorithm is not None else None
+                    if fit_stats is not None:
+                        head_stats['c2_fit_stats'] = fit_stats
 
                 # Compute train stats if requested
                 if compute_stats:
@@ -807,6 +914,7 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
 
             # Create batched algorithm instance
             batched_alg = batched_class(**self.algorithm_kwargs)
+            batched_alg.collect_fitting_diagnostics = self._fitting_diagnostics_enabled
 
             # Compact all heads in this layer at once
             # K_input, V_input, queries_layer all have shape (num_heads, ...)
@@ -876,6 +984,15 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                         'num_less_than_minus_7': int((beta_head < -7).sum().item()) if len(beta_head) > 0 else 0,
                     }} if verbose_logging else {})
                 }
+
+                if self._fitting_diagnostics_enabled:
+                    head_stats['key_matrix_stats'] = {
+                        'original_K': self._matrix_stats(K_input[head_idx]),
+                        'compacted_C1': self._matrix_stats(C1_compact[head_idx, :actual_returned_size]),
+                    }
+                    fit_stats = getattr(batched_alg, 'last_c2_fit_stats', None)
+                    if fit_stats is not None:
+                        head_stats['c2_fit_stats'] = fit_stats[head_idx]
 
                 # Compute train stats if requested
                 if compute_stats:
@@ -1050,6 +1167,7 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
 
         # Create batched algorithm instance
         batched_alg = batched_class(**self.algorithm_kwargs)
+        batched_alg.collect_fitting_diagnostics = self._fitting_diagnostics_enabled
 
         # Compact all (layer, head) pairs at once
         C1_compact, beta_compact, C2_compact, indices_batched = batched_alg.compute_compacted_cache_batched(
@@ -1111,6 +1229,15 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                         'num_less_than_minus_7': int((beta_head < -7).sum().item()) if len(beta_head) > 0 else 0,
                     }} if verbose_logging else {})
                 }
+
+                if self._fitting_diagnostics_enabled:
+                    head_stats['key_matrix_stats'] = {
+                        'original_K': self._matrix_stats(K_input[batch_idx]),
+                        'compacted_C1': self._matrix_stats(C1_compact[batch_idx]),
+                    }
+                    fit_stats = getattr(batched_alg, 'last_c2_fit_stats', None)
+                    if fit_stats is not None:
+                        head_stats['c2_fit_stats'] = fit_stats[batch_idx]
 
                 # Compute train stats if requested
                 if compute_stats:

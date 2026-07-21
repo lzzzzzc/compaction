@@ -221,6 +221,12 @@ def main():
         default=None,
         help='Random seed for Python, NumPy, and PyTorch CPU/CUDA RNGs (default: None)'
     )
+    parser.add_argument(
+        '--key-seed',
+        type=int,
+        default=None,
+        help='Independent Random-real-key selection seed for key_selection_ablation configs.'
+    )
 
     args = parser.parse_args()
 
@@ -282,6 +288,10 @@ def main():
             if args.precomputed_budget_path is not None:
                 method_kwargs[method_name]['precomputed_budget_path'] = args.precomputed_budget_path
                 method_kwargs[method_name]['max_ratio_per_head'] = args.max_ratio_per_head
+
+            if (args.key_seed is not None
+                    and method_kwargs[method_name].get('algorithm') == 'key_selection_ablation'):
+                method_kwargs[method_name]['key_seed'] = args.key_seed
 
     # Load query generation config
     query_config = load_query_config(args.query_config)

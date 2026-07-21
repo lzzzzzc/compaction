@@ -17,6 +17,7 @@ from .random_vector_keys import RandomVectorKeysCompaction
 from .truncate import TruncationCompaction
 from .highest_attention_keys import HighestAttentionKeysCompaction
 from .kvmerger import KVMergerCompaction
+from .key_selection_ablation import KeySelectionAblationCompaction
 
 __all__ = [
     'CompactionAlgorithm',
@@ -32,6 +33,7 @@ __all__ = [
     'TruncationCompaction',
     'HighestAttentionKeysCompaction',
     'KVMergerCompaction',
+    'KeySelectionAblationCompaction',
 ]
 
 # Registry of per-layer-head algorithms with their string names
@@ -48,4 +50,5 @@ ALGORITHM_REGISTRY = {
     'batched_optim_joint': BatchedOptimJointCompaction,
     'highest_attention_keys': HighestAttentionKeysCompaction,
     'kvmerger': KVMergerCompaction,
+    'key_selection_ablation': KeySelectionAblationCompaction,
 }

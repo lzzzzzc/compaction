@@ -63,6 +63,9 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
         self.config_name = config_name
         self.precomputed_budget_path = precomputed_budget_path
         self.max_ratio_per_head = max_ratio_per_head
+        self._compaction_call_index = 0
+        self._active_compaction_call_index = 0
+        self._selection_article_id = None
 
     def name(self) -> str:
         """Return the config name if provided, otherwise the algorithm name."""
@@ -73,6 +76,10 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
     def supports_fitting_diagnostics(self) -> bool:
         """This wrapper can expose exact C2-fit and key-matrix diagnostics."""
         return True
+
+    def set_selection_article_id(self, article_idx: int) -> None:
+        """Set a shard-stable article id for deterministic per-head key sampling."""
+        self._selection_article_id = int(article_idx)
 
     @staticmethod
     def _matrix_stats(matrix: torch.Tensor) -> Dict:
@@ -271,6 +278,12 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
             Statistics including per-layer-head metrics and query generation stats
         """
         self._fitting_diagnostics_enabled = fitting_diagnostics
+        self._active_compaction_call_index = (
+            self._selection_article_id
+            if self._selection_article_id is not None
+            else self._compaction_call_index
+        )
+        self._compaction_call_index += 1
 
         # Keep a reference for query generation before we normalize the main cache
         kv_for_queries = past_key_values_for_queries if past_key_values_for_queries is not None else past_key_values
@@ -617,6 +630,10 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                     # Create algorithm instance for this head
                     algorithm = self.algorithm_class(**self.algorithm_kwargs)
                     algorithm.collect_fitting_diagnostics = self._fitting_diagnostics_enabled
+                    if hasattr(algorithm, 'set_selection_context'):
+                        algorithm.set_selection_context(
+                            self._active_compaction_call_index, layer_idx, head_idx
+                        )
 
                     # Compact this head (or the subset)
                     C1_compact, beta_compact, C2_compact, selected_indices = algorithm.compute_compacted_cache(
@@ -705,6 +722,37 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
                         'num_less_than_minus_7': int((beta_for_stats < -7).sum().item()) if len(beta_for_stats) > 0 else 0,
                     }} if verbose_logging else {})
                 }
+
+                key_analysis = (
+                    getattr(algorithm, 'last_key_selection_analysis', None)
+                    if algorithm is not None else None
+                )
+                if key_analysis is not None:
+                    local_indices = key_analysis.get('local_indices', {})
+                    if is_partial_compaction:
+                        local_to_full = indices_list
+                        key_analysis['full_token_indices'] = {
+                            name: [int(local_to_full[idx]) for idx in values]
+                            for name, values in local_indices.items()
+                        }
+                        key_analysis['candidate_scope'] = {
+                            'kind': 'partial_compaction_range',
+                            'start': int(indices_list[0]),
+                            'end_exclusive': int(indices_list[-1] + 1),
+                            'count': len(indices_list),
+                        }
+                    else:
+                        key_analysis['full_token_indices'] = {
+                            name: [int(idx) for idx in values]
+                            for name, values in local_indices.items()
+                        }
+                        key_analysis['candidate_scope'] = {
+                            'kind': 'full_cache',
+                            'start': 0,
+                            'end_exclusive': int(K.shape[0]),
+                            'count': int(K.shape[0]),
+                        }
+                    head_stats['key_selection_analysis'] = key_analysis
 
                 if self._fitting_diagnostics_enabled:
                     head_stats['key_matrix_stats'] = {
@@ -805,6 +853,8 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
             self._aggregate_train_stats(all_stats, eval_queries_per_kv_head)
             if all_stats['train_stats_time'] > 0:
                 print(f"Total train stats computation time: {all_stats['train_stats_time']:.2f}s")
+
+        self._aggregate_key_selection_analysis(all_stats)
 
         return compacted_layers, all_stats
 
@@ -1313,3 +1363,71 @@ class PerLayerHeadCompaction(FullCacheCompactionAlgorithm):
             train_stats_per_head,
             eval_queries_per_kv_head
         )
+
+    @staticmethod
+    def _aggregate_key_selection_analysis(all_stats: Dict) -> None:
+        analyses = [
+            metrics['key_selection_analysis']
+            for metrics in all_stats.get('per_layer_head_metrics', {}).values()
+            if 'key_selection_analysis' in metrics
+        ]
+        if not analyses:
+            return
+
+        weights = [entry['budget'] for entry in analyses]
+        total_weight = sum(weights)
+        overlap_fields = ('overlap_ratio', 'jaccard', 'expected_overlap_ratio', 'normalized_overlap')
+        overlap_summary = {}
+        for field in overlap_fields:
+            values = [entry['overlap'].get(field) for entry in analyses]
+            valid = [(value, weight) for value, weight in zip(values, weights) if value is not None]
+            overlap_summary[field] = {
+                'macro_mean': float(sum(value for value, _ in valid) / len(valid)) if valid else None,
+                'budget_weighted_mean': (
+                    float(sum(value * weight for value, weight in valid) / sum(weight for _, weight in valid))
+                    if valid and sum(weight for _, weight in valid) > 0 else None
+                ),
+            }
+
+        spectra = {}
+        for routing_name in ('raw', 'fitted_bias'):
+            spectra[routing_name] = {}
+            for selection in ('top', 'random'):
+                series = [
+                    entry['routing'][routing_name][selection]['spectrum']['singular_values']
+                    for entry in analyses
+                ]
+                max_len = max((len(values) for values in series), default=0)
+                spectra[routing_name][selection] = [
+                    float(sum(values[idx] for values in series if idx < len(values)) /
+                          sum(1 for values in series if idx < len(values)))
+                    for idx in range(max_len)
+                ]
+
+        scalar_values = {}
+
+        def collect_scalars(prefix, value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {'local_indices', 'full_token_indices', 'singular_values'}:
+                        continue
+                    collect_scalars(f'{prefix}.{key}' if prefix else key, child)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                scalar_values.setdefault(prefix, []).append(float(value))
+
+        for analysis in analyses:
+            collect_scalars('', analysis)
+
+        macro_scalar_metrics = {
+            key: float(sum(values) / len(values))
+            for key, values in scalar_values.items()
+            if values
+        }
+
+        all_stats['all_head_key_selection_analysis'] = {
+            'num_heads': len(analyses),
+            'total_budget': int(total_weight),
+            'overlap': overlap_summary,
+            'mean_singular_values': spectra,
+            'macro_scalar_metrics': macro_scalar_metrics,
+        }

@@ -1972,6 +1972,18 @@ class QAEvaluator:
             if overall_all_head_test_stats:
                 overall_stats[method]['overall_all_head_test_stats'] = overall_all_head_test_stats
 
+            key_analysis_articles = [
+                {
+                    'article_idx': r['article_idx'],
+                    **r['compaction_stats']['all_head_key_selection_analysis'],
+                }
+                for r in method_results
+                if 'compaction_stats' in r
+                and 'all_head_key_selection_analysis' in r['compaction_stats']
+            ]
+            if key_analysis_articles:
+                overall_stats[method]['key_selection_analysis_per_article'] = key_analysis_articles
+
             # Per-article breakdown
             overall_stats[method]['per_article'] = []
             for r in method_results:
@@ -2285,6 +2297,21 @@ class QAEvaluator:
             compaction_method = get_compaction_method(method_name, kwargs)
 
             for article_idx in article_indices:
+                # Give every method the same query/decode RNG state for this article.
+                # Random-key selection uses its own private generator and therefore
+                # does not perturb this stream.
+                if seed is not None:
+                    article_seed = int(seed) + int(article_idx)
+                    import random
+                    import numpy as np
+                    random.seed(article_seed)
+                    np.random.seed(article_seed % (2**32))
+                    torch.manual_seed(article_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(article_seed)
+                if hasattr(compaction_method, 'set_selection_article_id'):
+                    compaction_method.set_selection_article_id(article_idx)
+
                 article_data = dataset[article_idx]
 
                 # TEMPORARY DEBUG: Print sample context and question for inspection

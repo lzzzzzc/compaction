@@ -749,8 +749,13 @@ def evaluate_compaction(
             ) from e
 
     # Compute original attention using SDPA
+    from contextlib import nullcontext
     from torch.nn.attention import SDPBackend, sdpa_kernel
-    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+    orig_sdpa_context = (
+        sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+        if queries_batch.device.type == 'cuda' else nullcontext()
+    )
+    with orig_sdpa_context:
         out_orig = torch.nn.functional.scaled_dot_product_attention(
             queries_batch, 
             K_batch, 
@@ -768,7 +773,11 @@ def evaluate_compaction(
     beta_mask = beta_mask.to(queries_batch.dtype)
 
     # Compute compacted attention using SDPA with beta bias
-    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+    comp_sdpa_context = (
+        sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+        if queries_batch.device.type == 'cuda' else nullcontext()
+    )
+    with comp_sdpa_context:
         out_comp = torch.nn.functional.scaled_dot_product_attention(
             queries_batch[:, :, :, :C1.shape[1]],  # (1, 1, n_test, d)
             C1_batch,  # (1, 1, t, d)

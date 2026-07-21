@@ -55,6 +55,14 @@ def get_compaction_method(
     chunking = method_kwargs.get('chunking', None)
     base_algorithm = method_kwargs.get('algorithm', method_name)
 
+    if base_algorithm == 'key_selection_ablation':
+        if method_kwargs.get('on_policy', False):
+            raise ValueError("key_selection_ablation requires off-policy reference queries")
+        if method_kwargs.get('use_batched', False):
+            raise ValueError("key_selection_ablation does not support batched compaction")
+        if chunking is not None and str(chunking).lower() != 'none':
+            raise ValueError("key_selection_ablation does not support chunked compaction")
+
     # no_context removes all content and cannot be used with chunking
     # (it returns a string, not a KV cache that can be concatenated)
     if base_algorithm == 'no_context' and chunking is not None and chunking.lower() != 'none':
